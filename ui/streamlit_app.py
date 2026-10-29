@@ -81,8 +81,6 @@ if 'OptimalSlumpFeatureBuilder' not in sys.modules['__main__'].__dict__:
     sys.modules['__main__'].OptimalSlumpFeatureBuilder = OptimalSlumpFeatureBuilder
 
 from multi_cement_workflow import MultiCementWorkflow
-from advanced_visualizer import AdvancedVisualizer
-from sensitivity_analyzer import SensitivityAnalyzer
 from material_database import MaterialDatabase
 from pdf_report_generator import PDFReportGenerator
 
@@ -110,7 +108,6 @@ def load_predictor_singleton():
     return predictor, model_status
 
 
-# ===== HELPER FUNCTIONS =====
 
 def build_user_input(material_db: MaterialDatabase) -> Dict:
     """Đọc input từ sidebar Streamlit"""
@@ -257,132 +254,9 @@ def create_co2_breakdown_chart(co2_data: Dict) -> go.Figure:
 
 # ===== NEW: S-CURVE VISUALIZATION =====
 
-def create_strength_development_chart(design: Dict, predictor, cement_type: str = "PC40") -> go.Figure:
-    """
-    Tạo biểu đồ đường cong phát triển cường độ (s-curve) - ROBUST VERSION
-    Tự động tính s nếu thiếu dữ liệu.
-    """
-    mix = design['mix_design']
-    f28 = design['predictions']['f28']
-    
-    # --- LOGIC THÔNG MINH: Lấy s từ design HOẶC dự đoán lại ---
-    if 's' in design['predictions'] and design['predictions']['s'] is not None:
-        s = design['predictions']['s']
-    else:
-        # Fallback: Gọi predictor nếu dữ liệu thiếu
-        df_input = pd.DataFrame([mix])
-        preds = predictor.predict(df_input, cement_type=cement_type)
-        s = preds.iloc[0]['s']
-
-    # Clip s để tránh biểu đồ bị dị biệt
-    s = np.clip(s, 0.15, 0.6) 
-    
-    # Tính toán đường cong
-    ages = np.array([1, 3, 7, 14, 28, 56, 90, 180, 365])
-    strengths = []
-    
-    for age in ages:
-        if age == 28:
-            strength = f28
-        else:
-            # Công thức Eurocode 2
-            beta = np.exp(s * (1.0 - np.sqrt(28.0 / age)))
-            strength = f28 * beta
-        strengths.append(strength)
-    
-    strengths = np.array(strengths)
-    
-    # Vẽ biểu đồ
-    fig = go.Figure()
-    
-    fig.add_trace(go.Scatter(
-        x=ages, y=strengths,
-        mode='lines+markers',
-        name=f'Pred. (s={s:.2f})',
-        line=dict(color='#2ecc71', width=3),
-        marker=dict(size=8, color='#27ae60', line=dict(width=2, color='white')),
-        hovertemplate='<b>Age: %{x} days</b><br>Strength: %{y:.1f} MPa<extra></extra>'
-    ))
-    
-    fig.add_trace(go.Scatter(
-        x=[28], y=[f28],
-        mode='markers',
-        name='Target f28',
-        marker=dict(size=15, color='#e74c3c', symbol='star', line=dict(width=2, color='white')),
-        hovertemplate='<b>f28: %{y:.1f} MPa</b><extra></extra>'
-    ))
-    
-    # Grid lines
-    for age in [3, 7, 28]:
-        fig.add_vline(x=age, line_dash="dash", line_color="gray", opacity=0.3)
-    
-    fig.update_layout(
-        title=f"Strength Development (s = {s:.3f})",
-        xaxis=dict(
-            title="Age (days)",
-            type='log', 
-            tickvals=[1, 3, 7, 14, 28, 56, 90, 180, 365],
-            ticktext=['1', '3', '7', '14', '28', '56', '90', '180', '365']
-        ),
-        yaxis=dict(title="Strength (MPa)"),
-        height=400,
-        hovermode='x unified',
-        margin=dict(l=20, r=20, t=40, b=20)
-    )
-    
-    return fig, s  # Trả về cả s để dùng cho bảng số liệu
-
-
-def create_s_parameter_comparison_chart(results: Dict) -> go.Figure:
-    """So sánh hệ số s giữa các designs"""
-    data = []
-    
-    for cement_type, proc in results["processed_results"].items():
-        for design in proc["ranked_designs"][:3]:
-            if 's' in design['predictions']:
-                 data.append({
-                    "Cement Type": cement_type,
-                    "Design": design['profile'],
-                    "s-parameter": design['predictions']['s'],
-                    "f28": design['predictions']['f28']
-                })
-    
-    if not data:
-        return go.Figure()
-
-    df = pd.DataFrame(data)
-    fig = go.Figure()
-    colors = {'PC40': '#3498db', 'PC50': '#e74c3c'}
-    
-    for cement_type in df['Cement Type'].unique():
-        df_ct = df[df['Cement Type'] == cement_type]
-        fig.add_trace(go.Bar(
-            name=cement_type,
-            x=df_ct['Design'],
-            y=df_ct['s-parameter'],
-            marker=dict(color=colors.get(cement_type, '#95a5a6')),
-            text=df_ct['s-parameter'].apply(lambda x: f"{x:.3f}"),
-            textposition='outside',
-            hovertemplate='<b>%{x}</b><br>s = %{y:.3f}<br>f28 = %{customdata:.1f} MPa<extra></extra>',
-            customdata=df_ct['f28']
-        ))
-    
-    fig.add_hline(y=0.20, line_dash="dash", line_color="green", annotation_text="Fast (s=0.20)")
-    fig.add_hline(y=0.38, line_dash="dash", line_color="orange", annotation_text="Normal (s=0.38)")
-    
-    fig.update_layout(
-        title="s-Parameter Comparison (Lower = Faster Development)",
-        yaxis_title="s-parameter", barmode='group', height=400,
-        margin=dict(l=20, r=20, t=40, b=20)
-    )
-    return fig
-
-
-# ===== MAIN APP =====
-
 def main():
     st.set_page_config(page_title="Concrete Optimizer", layout="wide", page_icon="🗿")
-    st.title("🗿 Multi-Cement Concrete Mix Design Optimizer")
+    st.title("Mô hình thiết kế và tối ưu hóa cấp phối bê tông")
     st.caption("NSGA-II Multi-objective Optimization System")
     st.markdown("---")
     
@@ -411,12 +285,15 @@ def main():
             c4.metric("Coarse Agg", f"{b['coarse_agg'][0]}-{b['coarse_agg'][1]}")
     
     st.subheader("⚙️ Optimization Settings")
+    # Thêm chú thích gợi ý
+    st.info("💡 **Gợi ý cài đặt nhanh:** Chọn 1 loại xi măng, đặt Population size = 50, Generations = 50, giữ nguyên Random seed")
     cement_types = st.multiselect("Select cement types", ["PC40", "PC50"], ["PC40", "PC50"])
     
     c1, c2, c3 = st.columns(3)
     pop_size = c1.number_input("Population size", 50, 300, 100, 10)
     n_gen = c2.number_input("Generations", 50, 500, 200, 10)
     seed = c3.number_input("Random seed", 0, 9999, 42, 1)
+    early_stop = st.checkbox("⏱️ Dừng sớm khi Pareto front hội tụ (nhanh hơn, tối đa = Generations)", value=False)
     
     if st.button("🚀 Run Optimization", type="primary"):
         if not cement_types:
@@ -436,7 +313,7 @@ def main():
             results = workflow.run_optimization(
                 user_input=user_input,
                 cement_types=cement_types,
-                optimization_config={"pop_size": int(pop_size), "n_gen": int(n_gen), "seed": int(seed)}
+                optimization_config={"pop_size": int(pop_size), "n_gen": int(n_gen), "seed": int(seed), "early_stop": bool(early_stop)}
             )
         
         st.success("✅ Optimization complete!")
@@ -447,7 +324,7 @@ def main():
         results = st.session_state["results"]
         st.markdown("## 📊 Optimization Results")
         
-        tabs = st.tabs(["📋 Summary", "🏆 Top Designs", "📈 Pareto Front", "🔬 Sensitivity"])
+        tabs = st.tabs(["📋 Summary", "🏆 Top Designs"])
         
         with tabs[0]:
             st.subheader("Executive Summary")
@@ -491,97 +368,6 @@ def main():
                             st.plotly_chart(create_cost_breakdown_chart({'breakdown': design['cost_breakdown']}), use_container_width=True, key=f"cost_{ct}_{i}")
                         with col4:
                             st.plotly_chart(create_co2_breakdown_chart(design['co2_breakdown']), use_container_width=True, key=f"co2_{ct}_{i}")
-                        
-                        # --- STRENGTH DEVELOPMENT ---
-                        st.markdown("---")
-                        st.markdown("**📈 Strength Development Curve**")
-                        
-                        fig_scurve, s_val = create_strength_development_chart(design, predictor, cement_type=ct)
-                        st.plotly_chart(fig_scurve, use_container_width=True, key=f"scurve_{ct}_{i}")
-                        
-                        # Calculate tables using s_val
-                        f28 = design['predictions']['f28']
-                        def get_f_t(t, f28, s): return f28 * np.exp(s * (1 - np.sqrt(28/t)))
-                        
-                        col_t1, col_t2 = st.columns(2)
-                        with col_t1:
-                            st.markdown("**Early Age Strength**")
-                            early_data = []
-                            for age in [1, 3, 7]:
-                                f_t = get_f_t(age, f28, s_val)
-                                early_data.append({"Age": f"{age} days", "f(t)": f"{f_t:.1f} MPa", "% f28": f"{f_t/f28*100:.0f}%"})
-                            st.dataframe(pd.DataFrame(early_data), hide_index=True, use_container_width=True)
-                        
-                        with col_t2:
-                            st.markdown("**Long-term Strength**")
-                            long_data = []
-                            for age in [56, 90, 180]:
-                                f_t = get_f_t(age, f28, s_val)
-                                long_data.append({"Age": f"{age} days", "f(t)": f"{f_t:.1f} MPa", "% f28": f"{f_t/f28*100:.0f}%"})
-                            st.dataframe(pd.DataFrame(long_data), hide_index=True, use_container_width=True)
-        
-        with tabs[2]:
-            st.subheader("📈 Pareto Front Analysis")
-            vis = AdvancedVisualizer()
-            
-            st.markdown("### 🎯 3D Pareto Front")
-            st.plotly_chart(vis.plot_interactive_pareto_3d(results["optimization_results"]), use_container_width=True)
-            
-            st.markdown("### 📊 2D Trade-off")
-            all_data = []
-            for ct, opt_res in results["optimization_results"].items():
-                _, F = opt_res['pareto_front']
-                for f in F:
-                    all_data.append({"Cement": ct, "Cost": f[0]/1000, "Strength": -f[1], "CO₂": f[3]})
-            
-            fig_scatter = px.scatter(pd.DataFrame(all_data), x="Cost", y="Strength", color="Cement", size="CO₂", 
-                                   title="Cost vs Strength Trade-off", labels={"Cost": "Cost (kVNĐ/m³)", "Strength": "Strength (MPa)"})
-            st.plotly_chart(fig_scatter, use_container_width=True)
-            
-            st.markdown("---")
-            st.markdown("### 📊 s-Parameter Analysis")
-            st.plotly_chart(create_s_parameter_comparison_chart(results), use_container_width=True)
-            
-            with st.expander("ℹ️ Understanding s-Parameter"):
-                 st.markdown("""
-                **s-parameter** controls strength development curve shape:
-                - **s = 0.20**: Fast strength gain (rapid hardening)
-                - **s = 0.25**: Above average rate
-                - **s = 0.38**: Normal development (standard OPC)
-                - **s = 0.50+**: Slow strength gain (high SCM)
-                
-                **Formula**: f(t) = f28 × exp[s × (1 - √(28/t))]
-                """)
-        
-        with tabs[3]:
-            st.subheader("🔬 Sensitivity Analysis")
-            ct_list = list(results["processed_results"].keys())
-            chosen_ct = st.selectbox("Select cement type", ct_list)
-            top_design = results["processed_results"][chosen_ct]["ranked_designs"][0]
-            analyzer = SensitivityAnalyzer()
-            
-            st.markdown("### 📊 One-at-a-Time Analysis (±5%)")
-            with st.spinner("Analyzing..."):
-                df_oat = analyzer.one_at_a_time_analysis(top_design["mix_design"], 0.05, chosen_ct)
-            
-            st.dataframe(df_oat[['factor', 'direction', 'delta_pct', 'f28_change', 'slump_change', 'cost_change']].style.format({
-                'delta_pct': '{:.1%}', 'f28_change': '{:.2f}', 'slump_change': '{:.1f}', 'cost_change': '{:,.0f}'
-            }), hide_index=True)
-            
-            fig_sens = go.Figure()
-            for direction in ['-', '+']:
-                df_dir = df_oat[df_oat['direction'] == direction]
-                fig_sens.add_trace(go.Bar(name=f"{direction}5%", x=df_dir['factor'], y=df_dir['f28_change']))
-            fig_sens.update_layout(title="Impact on f28 (±5%)", yaxis_title="Δ f28 (MPa)", barmode='group', height=400)
-            st.plotly_chart(fig_sens, use_container_width=True)
-            
-            st.markdown("### 🎲 Monte Carlo Robustness")
-            with st.spinner("Simulating..."):
-                df_mc = analyzer.monte_carlo_robustness(top_design["mix_design"], 200, 0.05, chosen_ct)
-            
-            c1, c2 = st.columns(2)
-            c1.plotly_chart(px.histogram(df_mc, x='f28', title='f28 Distribution'), use_container_width=True)
-            c2.plotly_chart(px.histogram(df_mc, x='cost', title='Cost Distribution'), use_container_width=True)
 
         st.markdown("---")
         st.subheader("📥 Export Results")

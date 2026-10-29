@@ -41,6 +41,21 @@ class SensitivityAnalyzer:
         self.cost_calc = CostCalculator(self.material_db)
         self.co2_calc = CO2Calculator(self.material_db)
 
+    def _predict_many(self, designs: List[Dict]) -> List[Dict]:
+        """Dự đoán nhiều design cùng lúc (nhanh); rơi về predict_all nếu không có predict_batch"""
+        if not designs:
+            return []
+        if hasattr(self.predictor, "predict_batch"):
+            try:
+                out = self.predictor.predict_batch(designs)
+                return [
+                    {"f28": float(out["f28"][i]), "s": float(out["s"][i]), "slump": float(out["slump"][i])}
+                    for i in range(len(designs))
+                ]
+            except Exception as e:
+                print(f"⚠️ predict_batch lỗi ({e}); dùng predict_all từng dòng.")
+        return [self.predictor.predict_all(d) for d in designs]
+
     # ------------------------------------------------------------------
     # 1) One-at-a-time (OAT) – tăng/giảm từng thành phần
     # ------------------------------------------------------------------
@@ -73,6 +88,7 @@ class SensitivityAnalyzer:
         base_cost = base_cost_data['total_cost']
         base_co2 = base_co2_data['total']
 
+        variants = []
         for factor in factors:
             if base_design.get(factor, 0) <= 0:
                 continue
@@ -81,32 +97,34 @@ class SensitivityAnalyzer:
                 design = base_design.copy()
                 delta = base_design[factor] * step_pct
                 design[factor] = base_design[factor] + (delta if direction == "+" else -delta)
+                variants.append((factor, direction, design))
 
-                # ✅ FIXED: Sử dụng predict_all()
-                pred = self.predictor.predict_all(design)
-                cost_data = self.cost_calc.calculate_total_cost(design, cement_type)
-                co2_data = self.co2_calc.calculate_total_emission(design, cement_type)
-                
-                cost = cost_data['total_cost']
-                co2 = co2_data['total']
+        preds = self._predict_many([v[2] for v in variants])
 
-                rows.append({
-                    "factor": factor,
-                    "direction": direction,
-                    "delta_pct": step_pct * (1 if direction == "+" else -1),
-                    "f28_baseline": base_pred["f28"],
-                    "f28_new": pred["f28"],
-                    "f28_change": pred["f28"] - base_pred["f28"],
-                    "slump_baseline": base_pred["slump"],
-                    "slump_new": pred["slump"],
-                    "slump_change": pred["slump"] - base_pred["slump"],
-                    "cost_baseline": base_cost,
-                    "cost_new": cost,
-                    "cost_change": cost - base_cost,
-                    "co2_baseline": base_co2,
-                    "co2_new": co2,
-                    "co2_change": co2 - base_co2
-                })
+        for (factor, direction, design), pred in zip(variants, preds):
+            cost_data = self.cost_calc.calculate_total_cost(design, cement_type)
+            co2_data = self.co2_calc.calculate_total_emission(design, cement_type)
+
+            cost = cost_data['total_cost']
+            co2 = co2_data['total']
+
+            rows.append({
+                "factor": factor,
+                "direction": direction,
+                "delta_pct": step_pct * (1 if direction == "+" else -1),
+                "f28_baseline": base_pred["f28"],
+                "f28_new": pred["f28"],
+                "f28_change": pred["f28"] - base_pred["f28"],
+                "slump_baseline": base_pred["slump"],
+                "slump_new": pred["slump"],
+                "slump_change": pred["slump"] - base_pred["slump"],
+                "cost_baseline": base_cost,
+                "cost_new": cost,
+                "cost_change": cost - base_cost,
+                "co2_baseline": base_co2,
+                "co2_new": co2,
+                "co2_change": co2 - base_co2
+            })
 
         return pd.DataFrame(rows)
 
@@ -132,19 +150,22 @@ class SensitivityAnalyzer:
             "fine_agg", "coarse_agg"
         ]
 
-        rows = []
+        designs = []
         for _ in range(n_samples):
             design = base_design.copy()
             for f in factors:
                 val = base_design.get(f, 0)
                 noise = 1 + rng.uniform(-variation_pct, variation_pct)
                 design[f] = max(val * noise, 0.0)
+            designs.append(design)
 
-            # ✅ FIXED: Sử dụng predict_all()
-            pred = self.predictor.predict_all(design)
+        preds = self._predict_many(designs)
+
+        rows = []
+        for design, pred in zip(designs, preds):
             cost_data = self.cost_calc.calculate_total_cost(design, cement_type)
             co2_data = self.co2_calc.calculate_total_emission(design, cement_type)
-            
+
             cost = cost_data['total_cost']
             co2 = co2_data['total']
 

@@ -424,6 +424,166 @@ class UnifiedPredictor:
 
         return float(f_age)
 
+    # =====================================================================
+    # BATCH API (nhanh): dự đoán cho cả quần thể trong 1 lần gọi
+    # Kết quả khớp với predict_f28 / predict_s / predict_slump (từng dòng)
+    # =====================================================================
+    MIX_KEYS = ['cement', 'water', 'flyash', 'slag', 'silica_fume',
+                'superplasticizer', 'fine_agg', 'coarse_agg']
+
+    SLUMP_FEATURE_NAMES = [
+        'cement', 'water', 'fine_agg', 'coarse_agg', 'sp',
+        'fly_ash', 'slag', 'silica_fume',
+        'binder', 'w_b', 'scm_frac', 'sand_ratio', 'sp_per_b', 'sp_per_w',
+        'paste_volume', 'agg_total', 'paste_to_agg', 'effective_w_c', 'pozzolanic_idx',
+        'w_b_x_scm', 'w_b_x_sp', 'sp_x_scm', 'w_b_sq', 'sp_per_b_sq',
+        'log_sp', 'log_silica_fume',
+        'sp_saturation', 'excess_water_idx', 'sp_at_low_wb', 'wb_sp_scm'
+    ]
+
+    def _build_features_batch(self, M: np.ndarray):
+        """
+        Vector hóa _build_features.
+        M: (n, 8) theo thứ tự MIX_KEYS. Trả về (X_f28_s [n,25], X_slump [n,30]).
+        Công thức giữ NGUYÊN như _build_features (kể cả paste_volume).
+        """
+        M = np.asarray(M, dtype=float)
+        cement, water, flyash, slag, sf, sp, fine, coarse = (M[:, i] for i in range(8))
+        acc = np.zeros_like(cement)  # accelerating_agent = 0
+
+        binder = cement + flyash + slag + sf
+        safe_binder = np.where(binder > 0, binder, 1.0)
+        w_b = water / safe_binder
+        scm = flyash + slag + sf
+        scm_frac = scm / safe_binder
+
+        total_agg = fine + coarse
+        safe_agg = np.where(total_agg > 0, total_agg, 1.0)
+        sand_ratio = fine / safe_agg
+
+        w_b_sq = w_b ** 2
+        w_b_cube = w_b ** 3
+        w_b_x_scm = w_b * scm_frac
+        cement_x_sf = cement * sf
+        w_b_x_binder = w_b * binder
+        cement_frac = cement / safe_binder
+        sf_frac = sf / safe_binder
+        paste_volume = (binder + water) / 2.5
+        log_binder = np.log1p(binder)
+        log_w_b = np.log(np.clip(w_b, 0.2, 1.0))
+
+        X_f28_s = np.column_stack([
+            cement, water, flyash, slag, sf, sp, fine, coarse, acc,
+            binder, w_b, scm, scm_frac, sand_ratio,
+            w_b_sq, w_b_cube, w_b_x_scm, cement_x_sf, w_b_x_binder,
+            cement_frac, sf_frac, total_agg, paste_volume,
+            log_binder, log_w_b
+        ])
+
+        sp_per_b = sp / safe_binder
+        sp_per_w = np.where(water > 0, sp / np.where(water > 0, water, 1.0), 0.0)
+        paste_to_agg = paste_volume / safe_agg
+        effective_w_c = np.where(cement > 0, water / np.where(cement > 0, cement, 1.0), 0.5)
+        pozzolanic_idx = (flyash + slag * 1.2 + sf * 2.0) / safe_binder
+
+        w_b_x_sp = w_b * sp_per_b
+        sp_x_scm = sp_per_b * scm_frac
+        sp_per_b_sq = sp_per_b ** 2
+        log_sp = np.log1p(sp)
+        log_silica_fume = np.log1p(sf)
+
+        sp_saturation = 1 - np.exp(-sp_per_b * 100)
+        excess_water_idx = np.maximum(w_b - 0.42, 0)
+        sp_at_low_wb = sp_per_b * np.exp(-w_b / 0.3)
+        wb_sp_scm = w_b * sp_per_b * scm_frac
+
+        X_slump = np.column_stack([
+            cement, water, fine, coarse, sp,
+            flyash, slag, sf,
+            binder, w_b, scm_frac, sand_ratio, sp_per_b, sp_per_w,
+            paste_volume, total_agg, paste_to_agg, effective_w_c, pozzolanic_idx,
+            w_b_x_scm, w_b_x_sp, sp_x_scm, w_b_sq, sp_per_b_sq,
+            log_sp, log_silica_fume,
+            sp_saturation, excess_water_idx, sp_at_low_wb, wb_sp_scm
+        ])
+        return X_f28_s, X_slump
+
+    @staticmethod
+    def _mean_models(models, X) -> np.ndarray:
+        """Mean dự đoán của list model, mỗi model gọi predict 1 lần cho cả lô"""
+        return np.mean([np.asarray(m.predict(X), dtype=float).reshape(-1) for m in models], axis=0)
+
+    def _predict_f28_X(self, X: np.ndarray) -> np.ndarray:
+        n = X.shape[0]
+        if not self.f28_bundle:
+            return np.zeros(n)
+
+        w_cat = self.f28_bundle.get('w_cat', 0.5)
+        w_xgb = self.f28_bundle.get('w_xgb', 0.5)
+        blend_iso = self.f28_bundle.get('blend_iso')
+
+        if self.cat_bundle and 'models' in self.cat_bundle:
+            cat_mean = self._mean_models(self.cat_bundle['models'], X)
+            cat_iso = self.cat_bundle.get('iso')
+            cat_final = cat_iso.transform(cat_mean) if cat_iso else cat_mean
+        else:
+            cat_final = np.zeros(n)
+
+        if self.xgb_bundle and 'models' in self.xgb_bundle:
+            xgb_mean = self._mean_models(self.xgb_bundle['models'], X)
+            xgb_iso = self.xgb_bundle.get('iso')
+            xgb_final = xgb_iso.transform(xgb_mean) if xgb_iso else xgb_mean
+        else:
+            xgb_final = np.zeros(n)
+
+        blend = w_cat * cat_final + w_xgb * xgb_final
+        final = blend_iso.transform(blend) if blend_iso else blend
+        return np.clip(np.asarray(final, dtype=float), 5, 120)
+
+    def _predict_s_X(self, X: np.ndarray) -> np.ndarray:
+        n = X.shape[0]
+        if not self.s_bundle:
+            return np.full(n, 0.25)
+        models = self.s_bundle.get('models', [])
+        if not models:
+            return np.full(n, 0.25)
+        iso = self.s_bundle.get('iso')
+        mean = self._mean_models(models, X)
+        out = iso.transform(mean) if iso else mean
+        return np.clip(np.asarray(out, dtype=float), 0.12, 0.60)
+
+    def _predict_slump_X(self, X: np.ndarray, max_folds: Optional[int] = None) -> np.ndarray:
+        n = X.shape[0]
+        if not self.slump_models:
+            return np.zeros(n)
+        import xgboost as xgb
+        dtest = xgb.DMatrix(X, feature_names=self.SLUMP_FEATURE_NAMES)  # tạo 1 lần, dùng cho mọi fold
+        folds = list(self.slump_models.values())
+        if max_folds:
+            folds = folds[:int(max_folds)]
+        preds = []
+        for fm in folds:
+            p_lgbm = np.asarray(fm['lgbm'].predict(X), dtype=float).reshape(-1)
+            p_xgb = np.asarray(fm['xgboost'].predict(dtest), dtype=float).reshape(-1)
+            preds.append((p_lgbm + p_xgb) / 2)
+        return np.clip(np.mean(preds, axis=0), 0, 300)
+
+    def predict_batch(self, M, max_slump_folds: Optional[int] = None) -> Dict[str, np.ndarray]:
+        """
+        Dự đoán f28, s, slump cho cả lô.
+        M: array (n, 8) theo thứ tự MIX_KEYS, hoặc list[dict] mix design.
+        max_slump_folds: chỉ dùng k fold đầu cho slump (None = dùng hết, kết quả y hệt predict_all).
+        """
+        if isinstance(M, (list, tuple)) and len(M) > 0 and isinstance(M[0], dict):
+            M = np.array([[d.get(k, 0.0) for k in self.MIX_KEYS] for d in M], dtype=float)
+        M = np.atleast_2d(np.asarray(M, dtype=float))
+        X_f28_s, X_slump = self._build_features_batch(M)
+        return {
+            'f28': self._predict_f28_X(X_f28_s),
+            's': self._predict_s_X(X_f28_s),
+            'slump': self._predict_slump_X(X_slump, max_slump_folds),
+        }
+
     def predict_all(self, mix_design: Dict[str, float]) -> Dict[str, float]:
         """Predict tất cả properties - INTERFACE CHO NSGA-II"""
         return {

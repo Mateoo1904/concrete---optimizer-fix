@@ -35,8 +35,10 @@ class MixDesignOptimizer:
         material_db: MaterialDatabase,
         pop_size: int = 100,
         n_gen: int = 200,
-        seed: int = 42
+        seed: int = 42,
+        early_stop: bool = False
     ):
+        self.early_stop = early_stop
         self.predictor = predictor
         self.material_db = material_db
         self.pop_size = pop_size
@@ -105,10 +107,20 @@ class MixDesignOptimizer:
             print(f"\n🚀 Running NSGA-II (pop={self.pop_size}, gen={self.n_gen})...")
             print(f"   This may take 3-5 minutes...")
 
+        if self.early_stop:
+            # Dừng sớm khi Pareto front hội tụ (tối đa n_gen thế hệ)
+            from pymoo.termination.default import DefaultMultiObjectiveTermination
+            termination = DefaultMultiObjectiveTermination(
+                xtol=1e-4, ftol=0.005, period=20,
+                n_max_gen=self.n_gen, n_max_evals=int(1e9)
+            )
+        else:
+            termination = ('n_gen', self.n_gen)
+
         res = minimize(
             problem,
             algorithm,
-            termination=('n_gen', self.n_gen),
+            termination=termination,
             seed=self.seed,
             verbose=verbose,
             save_history=False
@@ -152,29 +164,12 @@ class MixDesignOptimizer:
         fc_target = user_input.get('fc_target', 40)
         
         # ===== IMPORTANT: Tính actual strength cho mỗi design =====
-        actual_strengths = []
-        for i in range(len(X)):
-            mix = problem._x_to_mix_dict(X[i])
-            try:
-                predictions = problem.predictor.predict_all(mix)
-                predictions = problem.adjuster.adjust_predictions(
-                    mix, predictions, problem.cement_type
-                )
-                
-                age_target = user_input['age_target']
-                if age_target == 28:
-                    fc_age = predictions['f28']
-                else:
-                    fc_age = problem.predictor.predict_strength_at_age(mix, age_target)
-                    fc_age = problem.adjuster.adjust_predictions(
-                        mix, {'f28': fc_age}, problem.cement_type
-                    )['f28']
-                
-                actual_strengths.append(fc_age)
-            except:
-                actual_strengths.append(0)
-        
-        actual_strengths = np.array(actual_strengths)
+        # Nhanh: dự đoán cả Pareto front trong 1 lần; lỗi thì rơi về vòng lặp từng dòng
+        try:
+            _, _, _, fc_age_all = problem.predict_batch(X)
+            actual_strengths = np.asarray(fc_age_all, dtype=float)
+        except Exception:
+            actual_strengths = self._actual_strengths_loop(X, problem, user_input)
 
         # 1. Cost Optimized - Cheapest
         idx_cheap = np.argmin(F[:, 0])
@@ -217,6 +212,29 @@ class MixDesignOptimizer:
         designs.append(self._format_design(X[idx_slump], F[idx_slump], problem, "Slump Optimized"))
 
         return designs
+
+    def _actual_strengths_loop(self, X, problem, user_input) -> np.ndarray:
+        """Bản gốc (từng dòng) - dùng làm fallback"""
+        actual_strengths = []
+        for i in range(len(X)):
+            mix = problem._x_to_mix_dict(X[i])
+            try:
+                predictions = problem.predictor.predict_all(mix)
+                predictions = problem.adjuster.adjust_predictions(
+                    mix, predictions, problem.cement_type
+                )
+                age_target = user_input['age_target']
+                if age_target == 28:
+                    fc_age = predictions['f28']
+                else:
+                    fc_age = problem.predictor.predict_strength_at_age(mix, age_target)
+                    fc_age = problem.adjuster.adjust_predictions(
+                        mix, {'f28': fc_age}, problem.cement_type
+                    )['f28']
+                actual_strengths.append(fc_age)
+            except Exception:
+                actual_strengths.append(0)
+        return np.array(actual_strengths)
 
     def _format_design(
         self,

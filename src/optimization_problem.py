@@ -70,6 +70,9 @@ class ConcreteMixOptimizationProblem(Problem):
             xu=xu
         )
 
+        self.use_vectorized = True
+        self._prepare_vectorized()
+
     def __deepcopy__(self, memo):
         """Custom deepcopy để tránh copy predictor (chứa XGBoost models)"""
         cls = self.__class__
@@ -145,8 +148,116 @@ class ConcreteMixOptimizationProblem(Problem):
             penalty = excess * 2  # Penalty nhẹ hơn so với under-design
             return -self.fc_upper_limit + penalty
 
+    # =====================================================================
+    # VECTOR HÓA: đánh giá cả quần thể trong 1 lần (kết quả khớp _evaluate_loop)
+    # =====================================================================
+    def _prepare_vectorized(self):
+        """Tính sẵn đơn giá, hệ số CO2, tỷ trọng và hệ số hiệu chỉnh xi măng"""
+        n = len(self.var_names)
+        price = np.zeros(n)
+        co2_unit = np.zeros(n)
+        dens = np.zeros(n)
+        for i, name in enumerate(self.var_names):
+            if name == 'cement':
+                props = self.material_db.get_cement_props(self.cement_type)
+            else:
+                props = self.material_db.get_material_by_mix_key(name)
+            if props:
+                price[i] = props['price']
+                co2_unit[i] = (props['co2_production']
+                               + props['transport_distance'] * props['co2_transport'])
+            dens[i] = self.material_db.get_density(name)
+        self._price = price
+        self._co2_unit = co2_unit
+        self._dens = dens
+        self._a3 = self.co2_calc.a3_emission
+        self._factors = self.adjuster.cement_factors.get(
+            self.cement_type, self.adjuster.cement_factors['PC40'])
+
+    def predict_batch(self, X):
+        """
+        Dự đoán + hiệu chỉnh xi măng cho cả lô.
+        Trả về (f28, s, slump, fc_age) đều là mảng (n,).
+        """
+        M = np.atleast_2d(np.asarray(X, dtype=float))
+        pred = self.predictor.predict_batch(M)
+        fac = self._factors
+        f28 = pred['f28'] * fac['f28']
+        s = pred['s'] * fac['s_curve']
+        slump = pred['slump'] / fac['water_demand']
+
+        age_target = self.config['user_input']['age_target']
+        if age_target == 28:
+            fc_age = f28
+        else:
+            beta = np.exp(pred['s'] * (1.0 - np.sqrt(28.0 / age_target)))
+            fc_age = pred['f28'] * beta * fac['f28']
+        return f28, s, slump, fc_age
+
+    def _strength_objective_vec(self, fc: np.ndarray) -> np.ndarray:
+        under = -self.fc_target + (self.fc_target - fc) * 10
+        mid = -fc
+        over = -self.fc_upper_limit + (fc - self.fc_upper_limit) * 2
+        return np.where(fc < self.fc_target, under,
+                        np.where(fc <= self.fc_upper_limit, mid, over))
+
+    def _evaluate_vectorized(self, X, out):
+        M = np.atleast_2d(np.asarray(X, dtype=float))
+        n = M.shape[0]
+        ui = self.config['user_input']
+
+        _, _, slump, fc_age = self.predict_batch(M)
+
+        F = np.zeros((n, self.n_obj))
+        G = np.zeros((n, self.n_constr))
+
+        F[:, 0] = M @ self._price
+        F[:, 1] = self._strength_objective_vec(fc_age)
+        F[:, 2] = np.abs(slump - ui['slump_target'])
+        F[:, 3] = M @ self._co2_unit + self._a3
+
+        idx = {k: i for i, k in enumerate(self.var_names)}
+        binder = M[:, idx['cement']] + M[:, idx['flyash']] + M[:, idx['slag']] + M[:, idx['silica_fume']]
+        scm = M[:, idx['flyash']] + M[:, idx['slag']] + M[:, idx['silica_fume']]
+        pos = binder > 0
+        safe_b = np.where(pos, binder, 1.0)
+        w_b = np.where(pos, M[:, idx['water']] / safe_b, 0.5)
+        scm_frac = np.where(pos, scm / safe_b, 0.0)
+        volume = np.where(M > 0, M / self._dens, 0.0).sum(axis=1)
+
+        g = 0
+        for c in self.config['constraints']:
+            t = c['type']
+            if t == 'slump_tolerance':
+                G[:, g] = F[:, 2] - c['tolerance']; g += 1
+            elif t == 'strength_min':
+                G[:, g] = c['min_value'] - fc_age; g += 1
+            elif t == 'w_b_range':
+                G[:, g] = c['min'] - w_b; g += 1
+                G[:, g] = w_b - c['max']; g += 1
+            elif t == 'scm_limits':
+                G[:, g] = scm_frac - c['total']; g += 1
+            elif t == 'volume':
+                G[:, g] = np.abs(volume - c['target']) - c['tolerance']; g += 1
+            elif t == 'binder_range':
+                G[:, g] = c['min'] - binder; g += 1
+                G[:, g] = binder - c['max']; g += 1
+
+        out["F"] = F
+        out["G"] = G
+
     def _evaluate(self, X, out, *args, **kwargs):
-        """Evaluate population"""
+        """Evaluate population (ưu tiên bản vector hóa, lỗi thì rơi về bản từng dòng)"""
+        if self.use_vectorized:
+            try:
+                self._evaluate_vectorized(X, out)
+                return
+            except Exception as e:
+                print(f"⚠️ Vectorized evaluate lỗi ({e}); chuyển sang bản từng dòng.")
+        self._evaluate_loop(X, out, *args, **kwargs)
+
+    def _evaluate_loop(self, X, out, *args, **kwargs):
+        """Evaluate population (bản gốc, từng cá thể)"""
         pop_size = X.shape[0]
         F = np.zeros((pop_size, self.n_obj))
         G = np.zeros((pop_size, self.n_constr))
