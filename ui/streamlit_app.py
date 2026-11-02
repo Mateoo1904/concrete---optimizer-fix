@@ -256,7 +256,7 @@ def create_co2_breakdown_chart(co2_data: Dict) -> go.Figure:
 
 def main():
     st.set_page_config(page_title="Concrete Optimizer", layout="wide", page_icon="🗿")
-    st.title("Mô hình thiết kế và tối ưu hóa cấp phối bê tông")
+    st.title("🗿 Multi-Cement Concrete Mix Design Optimizer")
     st.caption("NSGA-II Multi-objective Optimization System")
     st.markdown("---")
     
